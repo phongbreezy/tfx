@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 from typing import Any, Dict, List, Text
 
 import absl
@@ -28,20 +29,11 @@ import tensorflow_model_analysis as tfma
 from google.protobuf import json_format
 from tfx import types
 from tfx.components.base import base_executor
+from tfx.components.evaluator import constants
 from tfx.proto import evaluator_pb2
 from tfx.types import artifact_utils
 from tfx.utils import io_utils
 from tfx.utils import path_utils
-
-# Key for examples in executor input_dict.
-EXAMPLES_KEY = 'examples'
-# Key for model in executor input_dict.
-MODEL_KEY = 'model'
-# Key for baseline model in executor input_dict.
-BASELINE_MODEL_KEY = 'baseline_model'
-
-# Key for anomalies in executor output_dict.
-EVALUATION_KEY = 'evaluation'
 
 
 class Executor(base_executor.BaseExecutor):
@@ -88,25 +80,23 @@ class Executor(base_executor.BaseExecutor):
     Returns:
       None
     """
-    if EXAMPLES_KEY not in input_dict:
+    if constants.EXAMPLES_KEY not in input_dict:
       raise ValueError('EXAMPLES_KEY is missing from input dict.')
-    if MODEL_KEY not in input_dict:
+    if constants.MODEL_KEY not in input_dict:
       raise ValueError('MODEL_KEY is missing from input dict.')
-    if EVALUATION_KEY not in output_dict:
+    if constants.EVALUATION_KEY not in output_dict:
       raise ValueError('EVALUATION_KEY is missing from output dict.')
-    if len(input_dict[MODEL_KEY]) > 1:
+    if len(input_dict[constants.MODEL_KEY]) > 1:
       raise ValueError(
           'There can be only one candidate model, there are {}.'.format(
-              len(input_dict[MODEL_KEY])))
-    if BASELINE_MODEL_KEY in input_dict and len(
-        input_dict[BASELINE_MODEL_KEY]) > 1:
+              len(input_dict[constants.MODEL_KEY])))
+    if constants.BASELINE_MODEL_KEY in input_dict and len(
+        input_dict[constants.BASELINE_MODEL_KEY]) > 1:
       raise ValueError(
           'There can be only one baseline model, there are {}.'.format(
-              len(input_dict[BASELINE_MODEL_KEY])))
+              len(input_dict[constants.BASELINE_MODEL_KEY])))
 
     self._log_startup(input_dict, output_dict, exec_properties)
-
-    output_uri = artifact_utils.get_single_uri(output_dict[EVALUATION_KEY])
 
     # Add fairness indicator metric callback if necessary.
     fairness_indicator_thresholds = exec_properties.get(
@@ -133,6 +123,9 @@ class Executor(base_executor.BaseExecutor):
           tags=tags,
           add_metrics_callbacks=add_metrics_callbacks)
 
+    output_uri = artifact_utils.get_single_uri(
+        output_dict[constants.EVALUATION_KEY])
+
     # Extract model artifacts.
     # Baseline will be ignored if baseline is not configured in model_spec.
     if 'eval_config' in exec_properties and exec_properties['eval_config']:
@@ -150,17 +143,17 @@ class Executor(base_executor.BaseExecutor):
         if model_spec.signature_name != 'eval':
           tags = [tf.saved_model.SERVING]
         if model_spec.is_baseline:
-          if BASELINE_MODEL_KEY not in input_dict:
+          if constants.BASELINE_MODEL_KEY not in input_dict:
             raise ValueError(
                 """No baseline model is present in Evaluator, check whether a
                  baseline is provided to the Executor.""")
           models[model_spec.name] = _get_eval_saved_model(
-              input_dict[BASELINE_MODEL_KEY], tags)
+              input_dict[constants.BASELINE_MODEL_KEY], tags)
           absl.logging.info('Using {} as baseline model.'.format(
               models[model_spec.name].model_path))
         else:
           models[model_spec.name] = _get_eval_saved_model(
-              input_dict[MODEL_KEY], tags)
+              input_dict[constants.MODEL_KEY], tags)
           absl.logging.info('Using {} for model eval.'.format(
               models[model_spec.name].model_path))
     else:
@@ -173,7 +166,7 @@ class Executor(base_executor.BaseExecutor):
                         feature_slicing_spec)
       slice_spec = self._get_slice_spec_from_feature_slicing_spec(
           feature_slicing_spec)
-      models = _get_eval_saved_model(input_dict[MODEL_KEY])
+      models = _get_eval_saved_model(input_dict[constants.MODEL_KEY])
       absl.logging.info('Using {} for model eval.'.format(models.model_path))
 
     absl.logging.info('Evaluating model.')
@@ -182,7 +175,8 @@ class Executor(base_executor.BaseExecutor):
       (pipeline
        | 'ReadData' >> beam.io.ReadFromTFRecord(
            file_pattern=io_utils.all_files_pattern(
-               artifact_utils.get_split_uri(input_dict[EXAMPLES_KEY], 'eval')))
+               artifact_utils.get_split_uri(input_dict[constants.EXAMPLES_KEY],
+                                            'eval')))
        |
        'ExtractEvaluateAndWriteResults' >> tfma.ExtractEvaluateAndWriteResults(
            eval_shared_model=models,
@@ -191,3 +185,43 @@ class Executor(base_executor.BaseExecutor):
            slice_spec=slice_spec))
     absl.logging.info(
         'Evaluation complete. Results written to {}.'.format(output_uri))
+
+    def _set_blessing_artifact(blessing: types.Artifact,
+                               model_artifact: List[types.Artifact]):
+      blessing.set_string_custom_property(
+          constants.ARTIFACT_PROPERTY_CURRENT_MODEL_URI_KEY,
+          artifact_utils.get_single_uri(model_artifact))
+      blessing.set_int_custom_property(
+          constants.ARTIFACT_PROPERTY_CURRENT_MODEL_ID_KEY,
+          model_artifact[0].id)
+      # TODO(jinhuang): fix test, this, Denote model component_name.
+      # blessing.set_string_custom_property(
+      #     'component_id', exec_properties['current_component_id'])
+
+    if constants.BLESSING_KEY not in output_dict:
+      return
+    blessing = artifact_utils.get_single_instance(
+        output_dict[constants.BLESSING_KEY])
+    _set_blessing_artifact(blessing, input_dict[constants.MODEL_KEY])
+    # TODO(jinhuang): Warn when baseline and threshold exist, but no "blessing".
+    validation_file = os.path.join(output_uri, tfma.constants.VALIDATIONS_KEY)
+    # Validation file does not exists, skip the validation:
+    if not os.path.exists(validation_file):
+      absl.logging.info(
+          'Validation result does not exist, skip Model Validation.')
+      return
+    absl.logging.info('Checking validation results.')
+    validation_result = tfma.load_validation_result(
+        os.path.join(output_uri, 'validations'))
+    if validation_result.validation_ok:
+      io_utils.write_string_file(
+          os.path.join(blessing.uri, constants.BLESSED_FILE_NAME), '')
+      blessing.set_int_custom_property(constants.ARTIFACT_PROPERTY_BLESSED_KEY,
+                                       constants.BLESSED_VALUE)
+    else:
+      io_utils.write_string_file(
+          os.path.join(blessing.uri, constants.NOT_BLESSED_FILE_NAME), '')
+      blessing.set_int_custom_property(constants.ARTIFACT_PROPERTY_BLESSED_KEY,
+                                       constants.NOT_BLESSED_VALUE)
+    absl.logging.info('Blessing result {} written to {}.'.format(
+        validation_result.validation_ok, blessing.uri))

@@ -7,6 +7,7 @@
 *   Added tfx model rewriting and tflite rewriter.
 *   Added LatestBlessedModelResolver as an experimental feature which gets the
     latest model that was blessed by model validator.
+*   Added Evaluator executor signatures to support model validations functionalities.
 
 ## Bug fixes and other changes
 * Added --skaffold_cmd flag when updating a pipeline for kubeflow in CLI.
